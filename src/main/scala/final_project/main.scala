@@ -111,14 +111,13 @@ object main {
   }
 
   def main(args: Array[String]): Unit = {
-    if (args.length != 1) {
-      System.err.println("Usage: final_project <input_edges.csv>")
+    if (args.length != 2) {
+      System.err.println("Usage: final_project <input_edges.csv> <output_path.csv>")
       System.exit(1)
     }
     val inputPath = args(0)
-    val inputFileName = inputPath.split("/").last.stripSuffix(".csv")
-    val tmpDir  = s"data/solutions/${inputFileName}_solution_tmp"
-    val finalCsv = s"data/solutions/${inputFileName}_solution.csv"
+    val outputPath = args(1)
+    val tmpDir = outputPath + "_tmp"
 
     val conf = new SparkConf().setAppName("ParallelizedPivotClustering")
     val sc   = new SparkContext(conf)
@@ -157,12 +156,12 @@ object main {
       .map(_.getPath)
       .find(_.getName.startsWith("part-"))
       .getOrElse(throw new RuntimeException(s"No part file in $tmpDir"))
-    fs.rename(part, new Path(finalCsv))
+    fs.rename(part, new Path(outputPath))
 
     // 4) delete the temp directory
     fs.delete(tmpPath, true)
 
-    println(s"=== Done! Clusters written to $finalCsv ===")
+    println(s"=== Done! Clusters written to $outputPath ===")
     sc.stop()
   }
 }
