@@ -85,6 +85,7 @@ object main {
     System.out.println(s"Total Iterations: $iterations, Time: $totalTime, isValid: $isValid")
     g
   }
+
   def verifyMIS(g_in: Graph[Int, Int]): Boolean = {
     // Checks if any adjacent vertices are in the MIS
     val adjacencyCheck = g_in.triplets.filter(triplet => triplet.srcAttr == 1 && triplet.dstAttr == 1).count() > 0
@@ -119,8 +120,17 @@ object main {
       sys.exit(1)
     }
     val startTimeMillis = System.currentTimeMillis()
-    val edges = sc.textFile(args(1)).map(line => {val x = line.split(","); Edge(x(0).toLong, x(1).toLong , 1)} )
+    val edges = sc.textFile(args(0)).map(line => {val x = line.split(","); Edge(x(0).toLong, x(1).toLong , 1)} )
     val g = Graph.fromEdges[Int, Int](edges, 0, edgeStorageLevel = StorageLevel.MEMORY_AND_DISK, vertexStorageLevel = StorageLevel.MEMORY_AND_DISK)
+    val isEmpty = g.vertices.isEmpty() && g.edges.isEmpty()
+    println("===========================")
+    if (isEmpty) {
+      println("The graph is empty!")
+    } else {
+      println("The graph is not empty!")
+    }
+    println("==========================")
+
     val g2 = LubyMIS(g)
 
     val endTimeMillis = System.currentTimeMillis()
@@ -130,6 +140,6 @@ object main {
     println("==================================")
 
     val g2df = spark.createDataFrame(g2.vertices)
-    g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(2))
+    g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(1))
   }
 }
