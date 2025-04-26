@@ -68,6 +68,11 @@ spark-submit --master "local[*]" --class "final_project.matching_verifier" targe
 
 ### Correlation Clustering
 
+Code to run Correlation Clustering:
+```
+spark-submit --master "local[*]" --class "final_project.main" target/scala-2.12/final_project_2.12-1.0.jar data/log_normal_100.csv data/log_normal_100_clustering.csv
+```
+
 The clustering verifier accepts 2 file paths as arguments, the first being the path to the file containing the initial graph and the second being the path to the file describing the clustering. It can be ran locally with the following command (keep in mind that your file paths may be different):
 ```
 // Linux
