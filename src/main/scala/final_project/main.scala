@@ -7,6 +7,7 @@ import org.apache.spark.graphx._
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.sql.SparkSession
 import scala.util.Random
+import org.apache.hadoop.fs.{FileSystem, Path}
 
 object main {
   // quieten Spark logging
@@ -16,11 +17,11 @@ object main {
 
   /** 
    * Parallelized‐Pivot clustering on an undirected, unweighted graph.
-   * Vertices carry a Long clusterId; 0 means “not assigned yet”.
-   * Returns same Graph with each vertex’s clusterId set to the pivot it joined.
+   * Vertices carry a Long clusterId; 0 means "not assigned yet".
+   * Returns same Graph with each vertex's clusterId set to the pivot it joined.
    */
   def parallelPivotClustering(g_in: Graph[Int, Int]): Graph[Long, Int] = {
-    // initialize all clusterIds to 0 (i.e. “unassigned”)
+    // initialize all clusterIds to 0 (i.e. "unassigned")
     var g: Graph[Long, Int] =
       g_in.mapVertices { case (vid, _) => 0L }
 
@@ -110,39 +111,58 @@ object main {
   }
 
   def main(args: Array[String]): Unit = {
-    if (args.length != 2) {
-      System.err.println("Usage: final_project <input_edges.csv> <output_clusters_dir>")
+    if (args.length != 1) {
+      System.err.println("Usage: final_project <input_edges.csv>")
       System.exit(1)
     }
+    val inputPath = args(0)
+    val inputFileName = inputPath.split("/").last.stripSuffix(".csv")
+    val tmpDir  = s"data/solutions/${inputFileName}_solution_tmp"
+    val finalCsv = s"data/solutions/${inputFileName}_solution.csv"
 
     val conf = new SparkConf().setAppName("ParallelizedPivotClustering")
     val sc   = new SparkContext(conf)
     val spark = SparkSession.builder.config(conf).getOrCreate()
 
-    // read edges as undirected graph
-    val edges = sc.textFile(args(0))
-      .map { line =>
-        val Array(a,b) = line.split(",").map(_.toLong)
-        Edge(a, b, 1)
-      }
-
-    val g0 = Graph.fromEdges[Int,Int](edges, defaultValue = 0,
-      edgeStorageLevel   = StorageLevel.MEMORY_AND_DISK,
-      vertexStorageLevel = StorageLevel.MEMORY_AND_DISK)
+    // 1) load edges
+    val edges = sc.textFile(inputPath).map { line =>
+      val Array(a,b) = line.split(",").map(_.toLong)
+      Edge(a, b, 1)
+    }
+    val graph = Graph.fromEdges[Int,Int](
+      edges,
+      defaultValue        = 0,
+      edgeStorageLevel    = StorageLevel.MEMORY_AND_DISK,
+      vertexStorageLevel  = StorageLevel.MEMORY_AND_DISK
+    )
 
     println("=== Starting Parallel Pivot Clustering ===")
-    val clustered: Graph[Long, Int] = parallelPivotClustering(g0)
+    val clustered: Graph[Long,Int] = parallelPivotClustering(graph)
 
-    // write out (vertexId, clusterId)
+    // 2) write to a *temporary* folder, coalesced to one part
     import spark.implicits._
-    val df = clustered.vertices.toDF("vertexId","clusterId")
-    df.coalesce(1)
+    clustered.vertices
+      .toDF("vertexId","clusterId")
+      .coalesce(1)
       .write
-      .format("csv")
+      .option("header","false")
       .mode("overwrite")
-      .save(args(1))
+      .csv(tmpDir)
 
-    println("=== Done! Clusters written to " + args(1) + " ===")
+    // 3) move the part-*.csv up to finalCsv
+    val fs = FileSystem.get(sc.hadoopConfiguration)
+    val tmpPath = new Path(tmpDir)
+    val part = fs
+      .listStatus(tmpPath)
+      .map(_.getPath)
+      .find(_.getName.startsWith("part-"))
+      .getOrElse(throw new RuntimeException(s"No part file in $tmpDir"))
+    fs.rename(part, new Path(finalCsv))
+
+    // 4) delete the temp directory
+    fs.delete(tmpPath, true)
+
+    println(s"=== Done! Clusters written to $finalCsv ===")
     sc.stop()
   }
 }
