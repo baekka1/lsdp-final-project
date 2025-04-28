@@ -136,7 +136,13 @@ object main {
     )
 
     println("=== Starting Parallel Pivot Clustering ===")
+    
+    val startTime = System.nanoTime()
     val clustered: Graph[Long,Int] = parallelPivotClustering(graph)
+    val endTime = System.nanoTime()
+    val duration = (endTime - startTime) / 1e9d  // Convert to seconds
+    
+    println(f"Clustering completed in $duration%.2f seconds")
 
     // 2) write to a *temporary* folder, coalesced to one part
     import spark.implicits._
