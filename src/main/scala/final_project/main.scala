@@ -262,6 +262,7 @@ object main {
 
     var clustered: Graph[Long, Int] = null
 
+    val startTime = System.nanoTime()
     if (method == "random") {
       println("=== Starting Parallel Pivot Clustering ===")
       clustered = parallelPivotClustering(graph)
@@ -272,6 +273,9 @@ object main {
       println("not a valid algorithm input")
       System.exit(1)
     }
+    val endTime = System.nanoTime()
+    val duration = (endTime - startTime) / 1e9d
+    println(f"Clustering completed in $duration%.2f seconds")
 
     val g2df = spark.createDataFrame(clustered.vertices)
     g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(2))
