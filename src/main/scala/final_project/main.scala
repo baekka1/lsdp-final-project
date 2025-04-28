@@ -15,6 +15,58 @@ object main {
   Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
   Logger.getLogger("org.spark-project").setLevel(Level.WARN)
 
+  def parallelPivot(g_in: Graph[Int, Int]): Graph[Int, Int] = {
+    val verticesRandom = g_in.vertices.map {
+      case (id, attr) => (
+        id, scala.util.Random.nextDouble()
+      )
+    }
+
+    val verticesRanked: RDD[(VertexID, Long)] = verticesRandom
+      .sortBy(_._2)
+      .zipWithIndex()
+      .map {
+        case ((id, _), idx) => (id, idx+1)
+      }
+
+    val g_new = Graph(verticesRanked, g_in.edges)
+
+    var g = g_in.mapVertices((id,attr) => 0)
+    var n_remaining_vertices = g.vertices.filter(_._2 == 0).count()
+    // 0 for NOT in a cluster, !0 for IN a cluster
+    var iterations = 0
+    val startTime = System.currentTimeMillis()
+
+    while (n_remaining_vertices > 0) {
+      val iterStart = System.currentTimeMillis()
+      iterations += 1
+
+      val neighborMin = g_new.aggregateMessages[Boolean] (
+        triplet => {
+          if triplet.srcAttr > 0 && triplet.dstAttr > 0 {
+            if triplet.srcAttr > triplet.dstAttr {
+              triplet.sendToSrc(false)
+              triplet.sendToDst(true)
+            }
+            if triplet.dstAttr > triplet.srcAttr {
+              triplet.sendToDst(false)
+              triplet.sendToSrc(true)
+            }
+          }
+        }, (a,b) => a && b
+      )
+
+      g_new = g_new.outerJoinVertices(neighborMin) {
+        case (id, attr, Some(msg)) =>
+          if (attr > 0 && msg) -attr
+      }
+
+
+    }
+  }
+
+
+
   /** 
    * Parallelized‐Pivot clustering on an undirected, unweighted graph.
    * Vertices carry a Long clusterId; 0 means "not assigned yet".
@@ -163,6 +215,7 @@ object main {
       .find(_.getName.startsWith("part-"))
       .getOrElse(throw new RuntimeException(s"No part file in $tmpDir"))
     fs.rename(part, new Path(outputPath))
+
 
     // 4) delete the temp directory
     fs.delete(tmpPath, true)
