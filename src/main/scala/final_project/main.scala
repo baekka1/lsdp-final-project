@@ -8,6 +8,8 @@ import org.apache.spark.storage.StorageLevel
 import org.apache.spark.sql.SparkSession
 import scala.util.Random
 import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.spark.rdd.RDD
+
 
 object main {
   // quieten Spark logging
@@ -15,54 +17,123 @@ object main {
   Logger.getLogger("org.apache.spark").setLevel(Level.WARN)
   Logger.getLogger("org.spark-project").setLevel(Level.WARN)
 
-  def parallelPivot(g_in: Graph[Int, Int]): Graph[Int, Int] = {
-    val verticesRandom = g_in.vertices.map {
-      case (id, attr) => (
-        id, scala.util.Random.nextDouble()
-      )
-    }
-
-    val verticesRanked: RDD[(VertexID, Long)] = verticesRandom
-      .sortBy(_._2)
-      .zipWithIndex()
-      .map {
-        case ((id, _), idx) => (id, idx+1)
-      }
+  def parallelPivotOriginal(g_in: Graph[Int, Int]): Graph[Long, Int] = {
+     val verticesRandom = g_in.vertices.map {
+         case (id, attr) => (
+           id, scala.util.Random.nextDouble()
+         )
+       }
+    val verticesRanked: RDD[(VertexId, Long)] = verticesRandom
+       .sortBy(_._2)
+       .zipWithIndex()
+       .map {
+          case ((id, _), idx) => (id, idx+1)
+        }
 
     val g_new = Graph(verticesRanked, g_in.edges)
+    var g: Graph[Long, Int] =
+      g_new.mapVertices { case (vid, _) => 0L }
 
-    var g = g_in.mapVertices((id,attr) => 0)
-    var n_remaining_vertices = g.vertices.filter(_._2 == 0).count()
-    // 0 for NOT in a cluster, !0 for IN a cluster
-    var iterations = 0
-    val startTime = System.currentTimeMillis()
+    val rank: Graph[(Long, Double), Int] = g.outerJoinVertices(verticesRanked) {
+      case (vid, cid, Some(rank)) =>
+        val newRank = if (cid == 0L) rank.toDouble else Double.PositiveInfinity
+        (cid, newRank)
 
-    while (n_remaining_vertices > 0) {
-      val iterStart = System.currentTimeMillis()
-      iterations += 1
+      case (vid, cid, None) =>
+        (cid, Double.PositiveInfinity)
+    }
 
-      val neighborMin = g_new.aggregateMessages[Boolean] (
-        triplet => {
-          if triplet.srcAttr > 0 && triplet.dstAttr > 0 {
-            if triplet.srcAttr > triplet.dstAttr {
-              triplet.sendToSrc(false)
-              triplet.sendToDst(true)
-            }
-            if triplet.dstAttr > triplet.srcAttr {
-              triplet.sendToDst(false)
-              triplet.sendToSrc(true)
-            }
-          }
-        }, (a,b) => a && b
-      )
+    var nUnassigned = g.vertices.filter { case (_, cid) => cid == 0L }.count()
+    var iteration = 0
 
-      g_new = g_new.outerJoinVertices(neighborMin) {
-        case (id, attr, Some(msg)) =>
-          if (attr > 0 && msg) -attr
+    while (nUnassigned > 0) {
+      iteration += 1
+
+      // 1) give each unassigned vertex a fresh random rank; assigned ones get +∞
+      var ranked: Graph[(Long, Double), Int] = g.mapVertices {
+        case (vid, cid) =>
+          val rank = if (cid == 0L) Random.nextDouble() else Double.PositiveInfinity
+          (cid, rank)
+      }
+      
+      ranked = ranked.outerJoinVertices(verticesRanked) {
+        case (vid, (cid, oldRank), Some(newRank)) =>
+          (cid, if (cid == 0L) newRank.toDouble else Double.PositiveInfinity)
+
+        case (vid, (cid, oldRank), None) =>
+          (cid, Double.PositiveInfinity)
       }
 
+      // 2) for each unassigned vertex, find the minimum rank among its unassigned neighbors
+      val neighborMinRank: VertexRDD[Double] = ranked.aggregateMessages[Double](
+        triplet => {
+          val (srcCid, srcRank) = triplet.srcAttr
+          val (dstCid, dstRank) = triplet.dstAttr
+          // only consider edges where both endpoints are still unassigned
+          if (srcCid == 0L && dstCid == 0L) {
+            triplet.sendToSrc(dstRank)
+            triplet.sendToDst(srcRank)
+          }
+        },
+        // take the smallest rank seen
+        math.min
+      )
 
+      // 3) identify the pivot set S = { v : rank(v) < minNeighborRank(v) }
+      val isPivot: VertexRDD[Boolean] = ranked.vertices.leftJoin(neighborMinRank) {
+        case (vid, (cid, rank), Some(minNb)) => cid == 0L && rank < minNb
+        case (vid, (cid, _),    None      ) => cid == 0L
+      }
+
+      // 4) prepare a triplet view that carries (oldCid, rank, isPivot) at each vertex
+      val withPivotAttr: Graph[(Long, Double, Boolean), Int] =
+        ranked.outerJoinVertices(isPivot) {
+          case (vid, (cid, rank), Some(isP)) => (cid, rank, isP)
+          case (vid, (cid, rank), None) => (cid, rank, false)  // Handle case where vertex wasn't in isPivot RDD
+        }
+
+      // 5a) collect messages from each pivot to itself -> cluster = pivotId
+      val pivotAssignments: VertexRDD[Long] =
+        ranked.vertices.innerJoin(isPivot) { (vid, attr, isP) =>
+          val (cid, _) = attr
+          if (isP) vid else cid
+        }
+
+      // 5b) collect messages from each pivot to its unassigned neighbors
+      //    since S is an independent set, no neighbor has two pivots, so no need to break ties
+      val neighborAssignments: VertexRDD[Long] = withPivotAttr.aggregateMessages[Long](
+        triplet => {
+          val (srcCid, _, srcIsP) = triplet.srcAttr
+          val (dstCid, _, dstIsP) = triplet.dstAttr
+          if (srcCid == 0L && dstCid == 0L && srcIsP) {
+            triplet.sendToDst(triplet.srcId)
+          }
+          if (srcCid == 0L && dstCid == 0L && dstIsP) {
+            triplet.sendToSrc(triplet.dstId)
+          }
+        },
+        // if somehow two pivots did touch the same neighbor, pick the smaller ID
+        (a, b) => math.min(a, b)
+      )
+
+      // 6) update cluster IDs in two steps:
+      //    a) assign pivot‐self messages
+      val afterPivots: Graph[Long, Int] = g.outerJoinVertices(pivotAssignments) {
+        case (vid, oldCid, Some(pivotId)) if oldCid == 0L => pivotId
+        case (vid, oldCid, _)                          => oldCid
+      }
+
+      //    b) assign neighbor messages
+      g = afterPivots.outerJoinVertices(neighborAssignments) {
+        case (vid, oldCid, Some(pivotId)) if oldCid == 0L => pivotId
+        case (vid, oldCid, _)                            => oldCid
+      }
+
+      nUnassigned = g.vertices.filter { case (_, cid) => cid == 0L }.count()
+      println(s"[ParallelPivot] iteration=$iteration, remaining unassigned=$nUnassigned")
     }
+
+    g
   }
 
 
@@ -163,15 +234,17 @@ object main {
   }
 
   def main(args: Array[String]): Unit = {
-    if (args.length != 2) {
-      System.err.println("Usage: final_project <input_edges.csv> <output_path.csv>")
+    if (args.length != 3) {
+      System.err.println("Usage: final_project method={original, random} <input_edges.csv> <output_path.csv>")
       System.exit(1)
     }
-    val inputPath = args(0)
-    val outputPath = args(1)
+    val method = args(0)
+    val inputPath = args(1)
+    val outputPath = args(2)
     val tmpDir = outputPath + "_tmp"
 
-    val conf = new SparkConf().setAppName("ParallelizedPivotClustering")
+    val conf = if (method == "random") new SparkConf().setAppName("ParallelizedPivotClustering")
+      else new SparkConf().setAppName("OriginalParallelizedPivotClustering")
     val sc   = new SparkContext(conf)
     val spark = SparkSession.builder.config(conf).getOrCreate()
 
@@ -187,38 +260,21 @@ object main {
       vertexStorageLevel  = StorageLevel.MEMORY_AND_DISK
     )
 
-    println("=== Starting Parallel Pivot Clustering ===")
-    
-    val startTime = System.nanoTime()
-    val clustered: Graph[Long,Int] = parallelPivotClustering(graph)
-    val endTime = System.nanoTime()
-    val duration = (endTime - startTime) / 1e9d  // Convert to seconds
-    
-    println(f"Clustering completed in $duration%.2f seconds")
+    var clustered: Graph[Long, Int] = null
 
-    // 2) write to a *temporary* folder, coalesced to one part
-    import spark.implicits._
-    clustered.vertices
-      .toDF("vertexId","clusterId")
-      .coalesce(1)
-      .write
-      .option("header","false")
-      .mode("overwrite")
-      .csv(tmpDir)
+    if (method == "random") {
+      println("=== Starting Parallel Pivot Clustering ===")
+      clustered = parallelPivotClustering(graph)
+    } else if (method == "original") {
+      println("=== Starting Original Parallel Pivot Clustering ===")
+      clustered = parallelPivotOriginal(graph)
+    } else {
+      println("not a valid algorithm input")
+      System.exit(1)
+    }
 
-    // 3) move the part-*.csv up to finalCsv
-    val fs = FileSystem.get(sc.hadoopConfiguration)
-    val tmpPath = new Path(tmpDir)
-    val part = fs
-      .listStatus(tmpPath)
-      .map(_.getPath)
-      .find(_.getName.startsWith("part-"))
-      .getOrElse(throw new RuntimeException(s"No part file in $tmpDir"))
-    fs.rename(part, new Path(outputPath))
-
-
-    // 4) delete the temp directory
-    fs.delete(tmpPath, true)
+    val g2df = spark.createDataFrame(clustered.vertices)
+    g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(2))
 
     println(s"=== Done! Clusters written to $outputPath ===")
     sc.stop()
