@@ -233,6 +233,75 @@ object main {
     g
   }
 
+/** Local search to improve clustering */
+def localSearch(graph: Graph[Long, Int], sc: SparkContext, numIterations: Int = 10): Graph[Long, Int] = {
+  var g = graph
+  for (iter <- 1 to numIterations) {
+    println(s"[LocalSearch] Starting iteration $iter")
+
+    // Compute cluster sizes and broadcast
+    val clusterSizes = sc.broadcast(
+      g.vertices.map { case (_, cid) => (cid, 1L) }
+        .reduceByKey(_ + _)
+        .collectAsMap()
+    )
+
+    // Compute neighbor cluster counts for each vertex
+    val neighborClusterCounts = g.aggregateMessages[Map[Long, Int]](
+      triplet => {
+        triplet.sendToSrc(Map(triplet.dstAttr -> 1))
+        triplet.sendToDst(Map(triplet.srcAttr -> 1))
+      },
+      (m1, m2) => m1 ++ m2.map { case (k, v) => k -> (v + m1.getOrElse(k, 0)) }
+    )
+
+    // Compute best move for each vertex
+    val moves: RDD[(VertexId, Long)] = g.vertices.join(neighborClusterCounts).map { 
+      case (vid, (cid, neighborCounts)) =>
+        val C = cid
+        val a = neighborCounts.getOrElse(C, 0) // Neighbors in current cluster
+        val n_C = clusterSizes.value.getOrElse(C, 0L) // Size of current cluster
+        // Change for moving to a new cluster (singleton, assign unique negative ID)
+        val changeNew = 2L * a - n_C + 1L
+        // Changes for moving to existing neighbor clusters
+        val changes = neighborCounts.toSeq.map { 
+          case (d, b) =>
+            if (d != C) {
+              val n_D = clusterSizes.value.getOrElse(d, 0L)
+              val change = 2L * b - 2L * a - n_C + n_D + 1L
+              (d, change)
+            } else {
+              (d, Long.MaxValue) // Skip moving to same cluster
+            }
+        }.filter(_._2 != Long.MaxValue)
+        
+        // Include new cluster option
+        val allOptions = changes :+ ((-vid - 1L, changeNew)) // Use -vid - 1 for new cluster
+        val (bestCluster, minChange) = allOptions.minBy(_._2)
+        val newCid = if (minChange < 0L) bestCluster else C
+        (vid, newCid)
+    }
+
+    // Update the graph with new cluster assignments
+    val oldVertices = g.vertices.map { case (vid, cid) => (vid, cid) }.cache()
+    g = Graph(moves, g.edges)
+    
+    // Compare old and new assignments to count changes
+    val changesMade = oldVertices.join(moves)
+      .filter { case (_, (oldCid, newCid)) => oldCid != newCid }
+      .count()
+    
+    oldVertices.unpersist()
+    
+    println(s"[LocalSearch] Iteration $iter completed, changes made: $changesMade")
+    if (changesMade == 0) {
+      println("[LocalSearch] No improvements found, stopping early")
+      return g
+    }
+  }
+  g
+}
+
   def main(args: Array[String]): Unit = {
     if (args.length != 3) {
       System.err.println("Usage: final_project method={original, random} <input_edges.csv> <output_path.csv>")
@@ -273,6 +342,8 @@ object main {
       println("not a valid algorithm input")
       System.exit(1)
     }
+    println("=== Starting Local Search ===")
+    clustered = localSearch(clustered, sc, numIterations = 10)
     val endTime = System.nanoTime()
     val duration = (endTime - startTime) / 1e9d
     println(f"Clustering completed in $duration%.2f seconds")
