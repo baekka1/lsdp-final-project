@@ -28,7 +28,7 @@ object main {
        .zipWithIndex()
        .map {
           case ((id, _), idx) => (id, idx+1)
-        }
+        }.cache()
 
     val g_new = Graph(verticesRanked, g_in.edges)
     var g: Graph[Long, Int] =
@@ -313,8 +313,8 @@ object main {
   }
 
   def main(args: Array[String]): Unit = {
-    if (args.length != 3) {
-      System.err.println("Usage: final_project method={original, random} <input_edges.csv> <output_path.csv>")
+    if (args.length != 4) {
+      System.err.println("Usage: final_project method={original, random} <input_edges.csv> <output_path.csv> <n_iterations>")
       System.exit(1)
     }
     val method = args(0)
@@ -353,10 +353,17 @@ object main {
       System.exit(1)
     }
     println("=== Starting Local Search ===")
-    clustered = localSearch(clustered, sc, numIterations = 20)
+    // Add checking to make sure 4th argument is an int (if necessary)
+    clustered = localSearch(clustered, sc, args(3).toInt)
+    val vertices = clustered.vertices.count()
+    println()
+    println("==========================================================")
+    println(s"Number of vertices: $vertices")
     val endTime = System.nanoTime()
     val duration = (endTime - startTime) / 1e9d
     println(f"Clustering completed in $duration%.2f seconds")
+    println("==========================================================")   
+    println()
 
     val g2df = spark.createDataFrame(clustered.vertices)
     g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(2))
