@@ -233,74 +233,84 @@ object main {
     g
   }
 
-/** Local search to improve clustering */
-def localSearch(graph: Graph[Long, Int], sc: SparkContext, numIterations: Int = 10): Graph[Long, Int] = {
-  var g = graph
-  for (iter <- 1 to numIterations) {
-    println(s"[LocalSearch] Starting iteration $iter")
+  def disagreements(g: Graph[Long,Int]): Long = g.triplets.filter(t => t.srcAttr != t.dstAttr).count()
 
-    // Compute cluster sizes and broadcast
-    val clusterSizes = sc.broadcast(
-      g.vertices.map { case (_, cid) => (cid, 1L) }
-        .reduceByKey(_ + _)
-        .collectAsMap()
-    )
+  def signedCost(g: Graph[Long,Int]): Long = {
+    val cuts = g.triplets.filter(t => t.attr > 0 && t.srcAttr != t.dstAttr).count()
 
-    // Compute neighbor cluster counts for each vertex
-    val neighborClusterCounts = g.aggregateMessages[Map[Long, Int]](
-      triplet => {
-        triplet.sendToSrc(Map(triplet.dstAttr -> 1))
-        triplet.sendToDst(Map(triplet.srcAttr -> 1))
-      },
-      (m1, m2) => m1 ++ m2.map { case (k, v) => k -> (v + m1.getOrElse(k, 0)) }
-    )
+    // edges that actually exist inside clusters
+    val posInside = g.triplets.filter(t => t.srcAttr == t.dstAttr).count()
 
-    // Compute best move for each vertex
-    val moves: RDD[(VertexId, Long)] = g.vertices.join(neighborClusterCounts).map { 
-      case (vid, (cid, neighborCounts)) =>
-        val C = cid
-        val a = neighborCounts.getOrElse(C, 0) // Neighbors in current cluster
-        val n_C = clusterSizes.value.getOrElse(C, 0L) // Size of current cluster
-        // Change for moving to a new cluster (singleton, assign unique negative ID)
-        val changeNew = 2L * a - n_C + 1L
-        // Changes for moving to existing neighbor clusters
-        val changes = neighborCounts.toSeq.map { 
-          case (d, b) =>
-            if (d != C) {
-              val n_D = clusterSizes.value.getOrElse(d, 0L)
-              val change = 2L * b - 2L * a - n_C + n_D + 1L
-              (d, change)
-            } else {
-              (d, Long.MaxValue) // Skip moving to same cluster
-            }
-        }.filter(_._2 != Long.MaxValue)
-        
-        // Include new cluster option
-        val allOptions = changes :+ ((-vid - 1L, changeNew)) // Use -vid - 1 for new cluster
-        val (bestCluster, minChange) = allOptions.minBy(_._2)
-        val newCid = if (minChange < 0L) bestCluster else C
-        (vid, newCid)
-    }
+    // for each cluster, number of possible pairs  nC choose 2
+    val clusterSizes = g.vertices.map(_._2).countByValue()  // Map[clusterId,Long]
+    val totalPairsInside =
+      clusterSizes.values.map(n => n*(n-1)/2).sum
 
-    // Update the graph with new cluster assignments
-    val oldVertices = g.vertices.map { case (vid, cid) => (vid, cid) }.cache()
-    g = Graph(moves, g.edges)
-    
-    // Compare old and new assignments to count changes
-    val changesMade = oldVertices.join(moves)
-      .filter { case (_, (oldCid, newCid)) => oldCid != newCid }
-      .count()
-    
-    oldVertices.unpersist()
-    
-    println(s"[LocalSearch] Iteration $iter completed, changes made: $changesMade")
-    if (changesMade == 0) {
-      println("[LocalSearch] No improvements found, stopping early")
-      return g
-    }
+    val missingInside = totalPairsInside - posInside
+    cuts + missingInside
   }
-  g
-}
+
+  /** Local search to improve clustering */
+  def localSearch(graph: Graph[Long, Int], sc: SparkContext, numIterations: Int = 10): Graph[Long, Int] = {
+    var g = graph
+    for (iter <- 1 to numIterations) {
+      println(s"[LocalSearch] Starting iteration $iter")
+      // println(s"[LocalSearch] cost before iter $iter = ${signedCost(g)}")
+
+      // Store current vertex assignments before making changes
+      val oldVertices = g.vertices.cache()
+
+      val clusterSizes = g.vertices                        // (vid , cid)
+                          .map { case (_, cid) => (cid, 1L) }
+                          .reduceByKey(_ + _)
+                          .collectAsMap()
+
+      val neighborClusterCounts = g.aggregateMessages[Map[Long, Int]](
+        ctx => {
+          ctx.sendToSrc(Map(ctx.dstAttr -> 1))
+          ctx.sendToDst(Map(ctx.srcAttr -> 1))
+        },
+        (m1, m2) => (m1.keySet ++ m2.keySet)
+                      .map(k => k -> (m1.getOrElse(k,0) + m2.getOrElse(k,0)))
+                      .toMap
+      ).persist()
+
+      val bcSizes = sc.broadcast(clusterSizes)  
+
+      val moves = g.vertices.join(neighborClusterCounts).map {
+        case (vid, (cid, neigh)) =>
+          val a      = neigh.getOrElse(cid, 0)
+          val choices = neigh - cid // every neighbour cluster D
+
+          if (choices.isEmpty) {
+            (vid, cid)
+          } else {
+            val (bestD, b) = choices.maxBy(_._2) // the D with largest b
+            val nC  = bcSizes.value(cid)
+            val nD  = bcSizes.value(bestD)
+
+            val delta = nD - nC + 1 + 2*(a - b)
+            if (delta < 0) (vid, bestD) else (vid, cid)
+          }
+      }
+      g = Graph(moves, g.edges)
+      
+      // Compare old and new assignments to count changes
+      val changesMade = oldVertices.join(moves)
+        .filter { case (_, (oldCid, newCid)) => oldCid != newCid }
+        .count()
+      neighborClusterCounts.unpersist(blocking = false)
+      oldVertices.unpersist()
+      
+      println(s"[LocalSearch] Iteration $iter completed, changes made: $changesMade")
+      // println(s"[LocalSearch] cost  after iter $iter = ${signedCost(g)}")
+      if (changesMade == 0) {
+        println("[LocalSearch] No improvements found, stopping early")
+        return g
+      }
+    }
+    g
+  }
 
   def main(args: Array[String]): Unit = {
     if (args.length != 3) {
@@ -343,7 +353,7 @@ def localSearch(graph: Graph[Long, Int], sc: SparkContext, numIterations: Int = 
       System.exit(1)
     }
     println("=== Starting Local Search ===")
-    clustered = localSearch(clustered, sc, numIterations = 10)
+    clustered = localSearch(clustered, sc, numIterations = 20)
     val endTime = System.nanoTime()
     val duration = (endTime - startTime) / 1e9d
     println(f"Clustering completed in $duration%.2f seconds")
