@@ -140,7 +140,7 @@ object main {
 
   /** 
    * Parallelized‐Pivot clustering on an undirected, unweighted graph.
-   * Vertices carry a Long clusterId; 0 means "not assigned yet".
+   * Vertices carry a clusterId; 0 means "not assigned yet".
    * Returns same Graph with each vertex's clusterId set to the pivot it joined.
    */
   def parallelPivotClustering(g_in: Graph[Int, Int]): Graph[Long, Int] = {
@@ -154,7 +154,7 @@ object main {
     while (nUnassigned > 0) {
       iteration += 1
 
-      // 1) give each unassigned vertex a fresh random rank; assigned ones get +∞
+      // 1) give each unassigned vertex a fresh random rank; assigned ones get +inf
       val ranked: Graph[(Long, Double), Int] = g.mapVertices {
         case (vid, cid) =>
           val rank = if (cid == 0L) Random.nextDouble() else Double.PositiveInfinity
@@ -255,15 +255,16 @@ object main {
     var g = graph
     for (iter <- 1 to numIterations) {
       println(s"[LocalSearch] Starting iteration $iter")
-      // println(s"[LocalSearch] cost before iter $iter = ${signedCost(g)}")
+      println(s"[LocalSearch] cost before iter $iter = ${signedCost(g)}")
 
-      // Store current vertex assignments before making changes
       val oldVertices = g.vertices.cache()
 
-      val clusterSizes = g.vertices                        // (vid , cid)
-                          .map { case (_, cid) => (cid, 1L) }
-                          .reduceByKey(_ + _)
-                          .collectAsMap()
+      val clusterSizes = g.vertices
+        .map { case (_, cid) => (cid, 1L) }
+        .reduceByKey(_ + _)
+        .collectAsMap()
+
+      val bcSizes = sc.broadcast(clusterSizes)
 
       val neighborClusterCounts = g.aggregateMessages[Map[Long, Int]](
         ctx => {
@@ -271,39 +272,65 @@ object main {
           ctx.sendToDst(Map(ctx.srcAttr -> 1))
         },
         (m1, m2) => (m1.keySet ++ m2.keySet)
-                      .map(k => k -> (m1.getOrElse(k,0) + m2.getOrElse(k,0)))
-                      .toMap
+          .map(k => k -> (m1.getOrElse(k, 0) + m2.getOrElse(k, 0)))
+          .toMap
       ).persist()
 
-      val bcSizes = sc.broadcast(clusterSizes)  
-
-      val moves = g.vertices.join(neighborClusterCounts).map {
-        case (vid, (cid, neigh)) =>
-          val a      = neigh.getOrElse(cid, 0)
-          val choices = neigh - cid // every neighbour cluster D
-
-          if (choices.isEmpty) {
-            (vid, cid)
-          } else {
-            val (bestD, b) = choices.maxBy(_._2) // the D with largest b
-            val nC  = bcSizes.value(cid)
-            val nD  = bcSizes.value(bestD)
-
-            val delta = nD - nC + 1 + 2*(a - b)
-            if (delta < 0) (vid, bestD) else (vid, cid)
-          }
+      // Create a graph with random priorities
+      val priorityGraph = g.mapVertices { case (vid, attr) => 
+        (attr, scala.util.Random.nextDouble())
       }
-      g = Graph(moves, g.edges)
-      
-      // Compare old and new assignments to count changes
-      val changesMade = oldVertices.join(moves)
+
+      // Get minimum neighbor priority for each vertex using the priority graph
+      val minNbrPriority = priorityGraph.aggregateMessages[Double](
+        triplet => {
+          val (_, srcPrio) = triplet.srcAttr
+          val (_, dstPrio) = triplet.dstAttr
+          triplet.sendToSrc(dstPrio)
+          triplet.sendToDst(srcPrio)
+        },
+        math.min
+      )
+
+      // Join vertices with their priorities and minimum neighbor priorities
+      val candidates = priorityGraph.vertices
+        .join(neighborClusterCounts)
+        .join(minNbrPriority)
+        .flatMap { case (vid, (((cid, selfPrio), neighMap), minPrio)) =>
+          val eligible = selfPrio < minPrio
+          if (!eligible) {
+            Iterator.empty
+          } else {
+            val a = neighMap.getOrElse(cid, 0)
+            val choices = neighMap - cid
+            if (choices.isEmpty) {
+              Iterator.empty
+            } else {
+              val (bestD, b) = choices.maxBy(_._2)
+              val nC = bcSizes.value(cid)
+              val nD = bcSizes.value(bestD)
+              val delta = nD - nC + 1 + 2 * (a - b)
+              if (delta < 0) Some((vid, bestD)) else None
+            }
+          }
+        }
+
+      val newVertices = g.vertices.leftOuterJoin(candidates).mapValues {
+        case (cid, Some(newCid)) => newCid
+        case (cid, None)         => cid
+      }
+
+      g = Graph(newVertices, g.edges)
+
+      val changesMade = oldVertices.join(newVertices)
         .filter { case (_, (oldCid, newCid)) => oldCid != newCid }
         .count()
+
       neighborClusterCounts.unpersist(blocking = false)
       oldVertices.unpersist()
-      
+
       println(s"[LocalSearch] Iteration $iter completed, changes made: $changesMade")
-      // println(s"[LocalSearch] cost  after iter $iter = ${signedCost(g)}")
+      println(s"[LocalSearch] cost  after iter $iter = ${signedCost(g)}")
       if (changesMade == 0) {
         println("[LocalSearch] No improvements found, stopping early")
         return g

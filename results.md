@@ -8,6 +8,7 @@
 | musae_ENGB_edges | 39,858 | 38,745 | 39,077 | 39,227 |
 | soc-pokec-relationships | 29,691,948 | 29,428,696 | 29,908,772 | 29,676,472 |
 | soc-LiveJournal1 | 51,969,799 | 51,527,018 | 52,129,550 | 51,875,456 |
+| twitter_original_edges | | | | |
 | com-orkut.ungraph | | | | |
 
 ### Timing Results (seconds)
@@ -17,5 +18,6 @@
 | musae_ENGB_edges | 4.60 | 4.26 | 5.77 | 4.88 |
 | soc-pokec-relationships | 115.14 | 219.31 | 358.40 | 230.95 |
 | soc-LiveJournal1 | 985.86 | 1687.05 | 3167.57 | 1946.83 |
+| twitter_original_edges | 806.64 | 2022.62 | | |
 | com-orkut.ungraph | | | | |
 

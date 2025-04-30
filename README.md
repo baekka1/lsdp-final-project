@@ -79,7 +79,7 @@ The clustering verifier accepts 2 file paths as arguments, the first being the p
 spark-submit --master local[*] --class final_project.clustering_verifier target/scala-2.12/project_3_2.12-1.0.jar /data/log_normal_100.csv data/log_normal_100_clustering.csv
 
 // Unix
-spark-submit --master "local[*]" --class "final_project.clustering_verifier" target/scala-2.12/project_3_2.12-1.0.jar data/log_normal_100.csv data/log_normal_100_clustering.csv
+spark-submit --master "local[*]" --class "final_project.clustering_verifier" target/scala-2.12/final_project_2.12-1.0.jar data/log_normal_100.csv data/log_normal_100_clustering.csv
 
 ```
 
