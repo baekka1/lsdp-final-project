@@ -8,6 +8,7 @@ import org.apache.spark.storage.StorageLevel
 import org.apache.spark.sql.SparkSession
 import scala.util.Random
 import org.apache.hadoop.fs.{FileSystem, Path}
+import scala.util.hashing.MurmurHash3
 import org.apache.spark.rdd.RDD
 
 
@@ -144,93 +145,88 @@ object main {
    * Returns same Graph with each vertex's clusterId set to the pivot it joined.
    */
   def parallelPivotClustering(g_in: Graph[Int, Int]): Graph[Long, Int] = {
-    // initialize all clusterIds to 0 (i.e. "unassigned")
-    var g: Graph[Long, Int] =
-      g_in.mapVertices { case (vid, _) => 0L }
-
-    var nUnassigned = g.vertices.filter { case (_, cid) => cid == 0L }.count()
-    var iteration = 0
-
-    while (nUnassigned > 0) {
-      iteration += 1
-
-      // 1) give each unassigned vertex a fresh random rank; assigned ones get +inf
-      val ranked: Graph[(Long, Double), Int] = g.mapVertices {
-        case (vid, cid) =>
-          val rank = if (cid == 0L) Random.nextDouble() else Double.PositiveInfinity
-          (cid, rank)
+    // 0) Partition + assign (clusterID, rank) once
+    var g: Graph[(Long,Double), Int] = g_in
+      .partitionBy(PartitionStrategy.EdgePartition2D)
+      .mapVertices { case (vid, _) =>
+        val rank = MurmurHash3.stringHash(vid.toString).toDouble
+        (0L, rank)
       }
+      .persist(StorageLevel.MEMORY_AND_DISK)
 
-      // 2) for each unassigned vertex, find the minimum rank among its unassigned neighbors
-      val neighborMinRank: VertexRDD[Double] = ranked.aggregateMessages[Double](
-        triplet => {
-          val (srcCid, srcRank) = triplet.srcAttr
-          val (dstCid, dstRank) = triplet.dstAttr
-          // only consider edges where both endpoints are still unassigned
-          if (srcCid == 0L && dstCid == 0L) {
-            triplet.sendToSrc(dstRank)
-            triplet.sendToDst(srcRank)
+    var iter = 0
+    var continue = true
+
+    while (continue) {
+      iter += 1
+
+      // 1) min‐neighbor‐rank among unassigned
+      val neighborMin: VertexRDD[Double] = g.aggregateMessages[Double](
+        sendMsg = ctx => {
+          val (sc, _) = ctx.srcAttr
+          val (dc, _) = ctx.dstAttr
+          if (sc == 0L && dc == 0L) {
+            ctx.sendToSrc(ctx.dstAttr._2)
+            ctx.sendToDst(ctx.srcAttr._2)
           }
         },
-        // take the smallest rank seen
-        math.min
+        mergeMsg = math.min
       )
 
-      // 3) identify the pivot set S = { v : rank(v) < minNeighborRank(v) }
-      val isPivot: VertexRDD[Boolean] = ranked.vertices.leftJoin(neighborMinRank) {
-        case (vid, (cid, rank), Some(minNb)) => cid == 0L && rank < minNb
-        case (vid, (cid, _),    None      ) => cid == 0L
+      // 2) pivot flag per vertex
+      val isPivot: VertexRDD[Boolean] = g.vertices.leftJoin(neighborMin) {
+        case (_, (cid, rank), optMin) => cid == 0L && optMin.forall(rank < _)
       }
 
-      // 4) prepare a triplet view that carries (oldCid, rank, isPivot) at each vertex
-      val withPivotAttr: Graph[(Long, Double, Boolean), Int] =
-        ranked.outerJoinVertices(isPivot) {
-          case (vid, (cid, rank), Some(isP)) => (cid, rank, isP)
-          case (vid, (cid, rank), None) => (cid, rank, false)  // Handle case where vertex wasn't in isPivot RDD
+      // 3a) pivots assign themselves via innerJoin (no shuffle)
+      val pivotSelf: VertexRDD[Long] = g.vertices
+        .innerJoin(isPivot) { (vid, _, flag) =>
+          if (flag) vid else 0L
         }
+        .filter { case (_, cid) => cid != 0L }
 
-      // 5a) collect messages from each pivot to itself -> cluster = pivotId
-      val pivotAssignments: VertexRDD[Long] =
-        ranked.vertices.innerJoin(isPivot) { (vid, attr, isP) =>
-          val (cid, _) = attr
-          if (isP) vid else cid
+      // 3b) inject pivot‐flag into the triplets
+      val enriched: Graph[(Long,Double,Boolean), Int] = g.outerJoinVertices(isPivot) {
+        case (_, (cid, rank), Some(flag)) => (cid, rank, flag)
+        case (_, (cid, rank), None)       => (cid, rank, false)
       }
-      
-      // 5b) collect messages from each pivot to its unassigned neighbors
-      //    since S is an independent set, no neighbor has two pivots, so no need to break ties
-      val neighborAssignments: VertexRDD[Long] = withPivotAttr.aggregateMessages[Long](
-        triplet => {
-          val (srcCid, _, srcIsP) = triplet.srcAttr
-          val (dstCid, _, dstIsP) = triplet.dstAttr
-          if (srcCid == 0L && dstCid == 0L && srcIsP) {
-            triplet.sendToDst(triplet.srcId)
-          }
-          if (srcCid == 0L && dstCid == 0L && dstIsP) {
-            triplet.sendToSrc(triplet.dstId)
-          }
+
+      // 3c) pivots assign neighbors
+      val pivotNbrsRaw: RDD[(VertexId, Long)] = enriched.aggregateMessages[Long](
+        sendMsg = ctx => {
+          val (sc, _, sp) = ctx.srcAttr
+          val (dc, _, dp) = ctx.dstAttr
+          if (sp && dc == 0L) ctx.sendToDst(ctx.srcId)
+          if (dp && sc == 0L) ctx.sendToSrc(ctx.dstId)
         },
-        // if somehow two pivots did touch the same neighbor, pick the smaller ID
-        (a, b) => math.min(a, b)
+        mergeMsg = math.min
       )
 
-      // 6) update cluster IDs in two steps:
-      //    a) assign pivot‐self messages
-      val afterPivots: Graph[Long, Int] = g.outerJoinVertices(pivotAssignments) {
-        case (vid, oldCid, Some(pivotId)) if oldCid == 0L => pivotId
-        case (vid, oldCid, _)                          => oldCid
-      }
+      // 4) collect all new assignments
+      val allUpdatesRdd: RDD[(VertexId, Long)] =
+        pivotSelf.union(pivotNbrsRaw)
+                 .filter(_._2 != 0L)
+                 .distinct()
 
-      //    b) assign neighbor messages
-      g = afterPivots.outerJoinVertices(neighborAssignments) {
-        case (vid, oldCid, Some(pivotId)) if oldCid == 0L => pivotId
-        case (vid, oldCid, _)                            => oldCid
-      }
+      // if no new assignments, we’re done
+      if (allUpdatesRdd.isEmpty()) {
+        continue = false
+      } else {
+        // wrap into VertexRDD so we can joinVertices
+        val updates: VertexRDD[Long] = VertexRDD(allUpdatesRdd)
 
-      nUnassigned = g.vertices.filter { case (_, cid) => cid == 0L }.count()
-      println(s"[ParallelPivot] iteration=$iteration, remaining unassigned=$nUnassigned")
+        println(s"[iter $iter] assigning ${updates.count()} vertices")
+
+        // 5) apply only the delta via map‐side join
+        g = g.joinVertices(updates) {
+          case (_, (oldCid, rank), newCid) =>
+            if (oldCid == 0L) (newCid, rank) else (oldCid, rank)
+        }
+      }
     }
 
-    g
+    // 6) strip off the rank
+    g.mapVertices { case (_, (cid, _)) => cid }
   }
 
   def disagreements(g: Graph[Long,Int]): Long = g.triplets.filter(t => t.srcAttr != t.dstAttr).count()

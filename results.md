@@ -1,4 +1,21 @@
-# Clustering Results Analysis
+Clustering Results Analysis
+
+## Using original PIVOT ranking
+### Disagreement Results
+| Dataset | Disagreements Trial 1 | Disagreements Trial 2 | Disagreements Trial 3 | Average Disagreements |
+|---------|---------------------|---------------------|---------------------|-------------------|
+| log_normal_100 | 2251 | 2263 | 2253 |2256  |
+| musae_ENGB_edges | 43,845 | 39,002 |  |  |
+| soc-pokec-relationships | | | | |
+| com-orkut.ungraph | | | | |
+
+### Timing Results (Seconds)
+| Dataset | Trial 1 | Trial 2 | Trial 3 | Average Time |
+|---------|---------|---------|---------|--------------|
+| log_normal_100 | 0.014 | 0.011 | 0.012 | 0.0123 |
+| musae_ENGB_edges | 0.012 | 0.017 |  |  |
+| soc-pokec-relationships | | | | |
+| com-orkut.ungraph | | | | |
 
 ## Using random rank
 ### Disagreement Results
