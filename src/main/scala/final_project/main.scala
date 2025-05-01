@@ -276,18 +276,18 @@ object main {
         (m1,m2) => (m1.keySet ++ m2.keySet)
                     .map(k => k -> (m1.getOrElse(k,0)+m2.getOrElse(k,0)))
                     .toMap
-      ).persist()
+      ).persist(StorageLevel.MEMORY_AND_DISK_SER)
 
       // 3) attach random priority to each vertex
-      val prioG = g.mapVertices { case (_,cid) =>
-        (cid, scala.util.Random.nextDouble())
-      }
+      val prios: VertexRDD[Double] =
+        g.vertices.mapValues(_ => scala.util.Random.nextDouble())
+                  .persist() 
 
       // 4) min neighbour priority
-      val minPrio = prioG.aggregateMessages[Double](
+      val minPrio = g.aggregateMessages[Double](
         t => {
-          val (_,pSrc) = t.srcAttr ; val (_,pDst) = t.dstAttr
-          t.sendToSrc(pDst) ; t.sendToDst(pSrc)
+          t.sendToSrc(prios.lookup(t.dstId).head)
+          t.sendToDst(prios.lookup(t.srcId).head)
         },
         math.min
       )
