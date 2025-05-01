@@ -261,11 +261,11 @@ object main {
       println(s"[LS] iter $iter   cost = ${signedCost(g)}")
 
       // 1) tiny broadcast: cluster sizes
-      val clusterSizes = g.vertices
-                          .map{ case (_,cid) => (cid,1L) }
-                          .reduceByKey(_+_)
-                          .collectAsMap()
-      val bcSize = sc.broadcast(clusterSizes)
+      val bcSize = sc.broadcast(
+        g.vertices.map { case (_,cid) => (cid,1L) }
+                .reduceByKey(_+_)
+                .collectAsMap()
+      )
 
       // 2) heavy neighbour map  (vid -> Map[cid -> deg])
       val neigh = g.aggregateMessages[Map[Long,Int]](
@@ -279,40 +279,33 @@ object main {
       ).persist(StorageLevel.MEMORY_AND_DISK_SER)
 
       // 3) attach random priority to each vertex
-      val prios: VertexRDD[Double] =
-        g.vertices.mapValues(_ => scala.util.Random.nextDouble())
-                  .persist() 
+      val gWithPrio = g.mapVertices { case (_,cid) =>
+        (cid, scala.util.Random.nextDouble())
+      }
 
       // 4) min neighbour priority
-      val minPrio = g.aggregateMessages[Double](
+      val minPrio = gWithPrio.aggregateMessages[Double](
         t => {
-          t.sendToSrc(prios.lookup(t.dstId).head)
-          t.sendToDst(prios.lookup(t.srcId).head)
+          val (_,pSrc) = t.srcAttr ; val (_,pDst) = t.dstAttr
+          t.sendToSrc(pDst) ; t.sendToDst(pSrc)
         },
         math.min
       )
 
       // 5) compute moves on the independent-set vertices
-      val candidates = prioG.vertices
-        .join(neigh)            // (vid -> ((cid,prio) , neighMap))
-        .map { case (vid, ((cid, prio), neighMap)) => 
-          (vid, (cid, prio, neighMap))
-        }
-        .leftOuterJoin(minPrio)
-        .flatMap { case (vid, ((cid, prio, neighMap), optMin)) =>
-          val eligible = optMin match {
-            case Some(minP) => prio < minP
-            case None => true
-          }
-          
+      val candidates = gWithPrio.vertices // (vid → (cid,prio))
+        .join(neigh) // add neighMap
+        .leftOuterJoin(minPrio) // add minNbrPrio
+        .flatMap { case (vid, (((cid, prio), neigh), minOpt)) =>
+          val eligible = minOpt.forall(prio < _)
           if (!eligible) Nil
           else {
-            val a = neighMap.getOrElse(cid, 0)
-            val opts = neighMap - cid
+            val a = neigh.getOrElse(cid, 0)
+            val opts = neigh - cid
             if (opts.isEmpty) Nil
             else {
-              val (bestD, b) = opts.maxBy(_._2)
-              val nC = bcSize.value.getOrElse(cid, 0L)
+              val (bestD,b) = opts.maxBy(_._2)
+              val nC = bcSize.value.getOrElse(cid,   0L)
               val nD = bcSize.value.getOrElse(bestD, 0L)
               val delta = nD - nC + 1 + 2*(a - b)
               if (delta < 0) Some((vid, bestD)) else Nil
