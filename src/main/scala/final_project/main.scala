@@ -149,7 +149,7 @@ object main {
     var g: Graph[(Long,Double), Int] = g_in
       .partitionBy(PartitionStrategy.EdgePartition2D)
       .mapVertices { case (vid, _) =>
-        val rank = scala.util.Random.nextDouble()
+        val rank = MurmurHash3.stringHash(vid.toString).toDouble
         (0L, rank)
       }
       .persist(StorageLevel.MEMORY_AND_DISK)
@@ -163,11 +163,11 @@ object main {
       // 1) min‐neighbor‐rank among unassigned
       val neighborMin: VertexRDD[Double] = g.aggregateMessages[Double](
         sendMsg = ctx => {
-          val (sc, sr) = ctx.srcAttr
-          val (dc, dr) = ctx.dstAttr
+          val (sc, _) = ctx.srcAttr
+          val (dc, _) = ctx.dstAttr
           if (sc == 0L && dc == 0L) {
-            ctx.sendToSrc(sr)
-            ctx.sendToDst(dr)
+            ctx.sendToSrc(ctx.dstAttr._2)
+            ctx.sendToDst(ctx.srcAttr._2)
           }
         },
         mergeMsg = math.min
@@ -180,8 +180,9 @@ object main {
 
       // 3a) pivots assign themselves via innerJoin (no shuffle)
       val pivotSelf: VertexRDD[Long] = g.vertices
-        .innerJoin(isPivot) { (vid, _, flag) =>
-          if (flag) vid else 0L
+        .innerJoin(isPivot) {
+          case (vid, (cid, _), isP) =>
+            if (isP && cid == 0L) vid else 0L
         }
         .filter { case (_, cid) => cid != 0L }
 
