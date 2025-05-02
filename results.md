@@ -56,8 +56,12 @@ the vertex with the lowest assigned permutation out of all of its neighbors as
 the pivot. Vertices then join their nearest pivot neighbor (if applicable) and
 they form a cluster. Repeat until all the vertices have been clustered. After a
 clustering has been determined, we run inner local search on all the clusters in
-order to reduce the number of disagreements. [more on inner local search if we
-get that working] 
+order to reduce the number of disagreements. We chose inner local search because
+through our experimentations, local search proved to be too memory and
+computationally expensive. With inner local search, we only consider the
+vertices and edges of one cluster at a time instead of the whole graph. In the
+ppaer by *Corder and Kollios '23*, they showed that this approach is scalable
+and produces as good as, or better clusterings than regular local search. 
 
 With the parallelized PIVOT and local search, we were able to get pretty good
 results. As both are parallelizable, we started with this approach because we
