@@ -38,3 +38,16 @@ Clustering Results Analysis
 | twitter_original_edges | 806.64 | 2022.62 | | |
 | com-orkut.ungraph | | | | |
 
+## Best Disagreement Results
+| Dataset| Number of Diagreements| Time | Method of Computation|
+|--------|-----------------------|------|----------------------|
+|log_normal_100| | | |
+| musae_ENGB_edges ||||
+|soc-pokec-relationships ||||
+|soc-LiveJournal1 ||||
+|twitter_original_edges ||||
+|com-orkut.ungraph ||||
+
+## Description of Approach
+
+## Discussion of Algorithm
