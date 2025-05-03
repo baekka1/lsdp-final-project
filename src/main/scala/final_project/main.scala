@@ -336,122 +336,144 @@ object main {
     g
   }
 
-  /* ONE independent‑set sweep; returns (updatedGraph, #moved vertices) */
-  def localSearchOnce(
-          g:      Graph[(Long,Long),Int], // (cid,sizeC)
-          bcSize: Broadcast[scala.collection.Map[Long,Long]]
-        ): (Graph[(Long,Long),Int], Long) = {
 
-    // 1) neighbour map: cid -> positive edges to that cluster
-    val neigh = g.aggregateMessages[Map[Long,Int]](
-      ctx => {
-        val (cS,_) = ctx.srcAttr ; val (cD,_) = ctx.dstAttr
-        ctx.sendToSrc(Map(cD -> 1)); ctx.sendToDst(Map(cS -> 1))
-      },
-      (m1,m2) => (m1.keySet ++ m2.keySet)
-                  .map(k => k -> (m1.getOrElse(k,0)+m2.getOrElse(k,0)))
-                  .toMap
-    )
+  def localSearchOnSubgraph(
+      subgraph: Graph[Long, Int],         // vertexId -> clusterId (all same to start)
+      sc: SparkContext,
+      clusterId: Long,
+      numIter: Int = 10
+  ): Graph[Long, Int] = {
 
-    // 2) priorities & min‑neighbour priority
-    val prio    = g.mapVertices((_,_) => Random.nextDouble())
-    val minPrio = prio.aggregateMessages[Double](
-        ctx => { ctx.sendToSrc(ctx.dstAttr); ctx.sendToDst(ctx.srcAttr) },
-        math.min
-    )
+    var g = Graph(subgraph.vertices, subgraph.edges.cache()) // keep edges cached
 
-    // 3) decide moves
-    val moves = g.vertices.join(prio.vertices)               
-      .join(neigh)
-      .leftOuterJoin(minPrio)
-      .flatMap { case (vid, ((((cid,nC),p), nMap), minOpt)) =>
-        if (minOpt.exists(p >= _)) Nil // not in i‑set
-        else {
-          val a   = nMap.getOrElse(cid,0)
-          val opt = nMap - cid
-          if (opt.isEmpty) Nil
-          else {
-            val (bestCid,b) = opt.maxBy(_._2)
-            val nD = bcSize.value.getOrElse(bestCid,0L) // O(1)
-            val delta = nD - nC + 1 + 2*(a-b)
-            if (delta < 0) Some((vid,(cid,bestCid))) else Nil
-          }
-        }
-      }
+    for (iter <- 1 to numIter) {
+      println(s"[LS-$clusterId] iter $iter   cost = ${signedCost(g)}")
 
-    if (moves.isEmpty) return (g,0L)
-    val moved = moves.count()
-
-    // 4) apply moves & update size counters locally
-    val movedRDD = moves.mapValues(_._2).cache() // vid -> newCid
-    val sizeUpdates = moves.flatMap{ case (_, (oldCid,newCid)) =>
-                          Seq((oldCid,-1L),(newCid,1L))
-                      }.reduceByKey(_+_)
-
-    val g2 = g.joinVertices(movedRDD){ (_, v, newCid) => (newCid, v._2) }
-              .joinVertices(sizeUpdates){ (_, v, d)   => (v._1, v._2+d) }
-              .cache()
-
-    (g2, moved)
-  }
-
-  /** driver‑side, deterministic inner local search (COCOA ’23, Alg. 3)
-    *
-    * @param graph          pivot clustering   (vertex attr = cluster‑id)
-    * @param sc             SparkContext (driver)
-    * @param numInnerIter   ≤ sweeps inside each cluster
-    * @param maxOuterPass   hard cap on global passes
-    */
-  def innerLocalSearch(
-          graph:        Graph[Long,Int],
-          sc:           SparkContext,
-          numInnerIter: Int  = 5,
-          maxOuterPass: Int  = 10): Graph[Long,Int] = {
-
-    // attach initial size
-    var g = graph.mapVertices[Tuple2[Long, Long]]{ case (_, v) => (v, 1L) }.cache()
-    val initSizes = g.aggregateMessages[Long](ctx => ctx.sendToSrc(1L), _+_)
-    g = g.joinVertices(initSizes){ (_, v, sz) => (v._1, sz) }.cache()
-
-    var outer = 0
-    var movedG = 1L
-
-    while (outer < maxOuterPass && movedG > 0) {
-      outer += 1
-      movedG = 0L
-      val bcSizes = sc.broadcast(
-        g.vertices // (vid , (cid , sizeC))
-        .map{ case (_, (cid, _)) => (cid, 1L) }
-        .reduceByKey(_ + _) // (# vertices per cluster)  – small shuffle
-        .collectAsMap() // Map[Long,Long]   (driver)
+      val bcSize = sc.broadcast(
+        g.vertices.map { case (_, cid) => (cid, 1L) }
+                  .reduceByKey(_ + _)
+                  .collectAsMap()
       )
 
-      for (cid <- g.vertices.map(_._2._1).distinct().collect()) {
-        val sub = g.subgraph(vpred = (_, c) => c._1 == cid).cache()
-        if (sub.numVertices > 1) {
-          var sg = sub
-          var k  = 0 ; var moved = 1L
-          while (k < numInnerIter && moved > 0) {
-            val res = localSearchOnce(sg, bcSizes)
-            sg   = res._1 ; moved = res._2 ; k += 1
-          }
-          movedG += moved
-          if (moved > 0)
-            g = g.outerJoinVertices(sg.vertices){
-                  case (_, old, Some(newAttr)) => newAttr
-                  case (_, old, None)          => old
-                }.cache()
-        }
-        sub.unpersist(false)
+      val neigh = g.aggregateMessages[Map[Long, Int]](
+        ctx => {
+          ctx.sendToSrc(Map(ctx.dstAttr -> 1))
+          ctx.sendToDst(Map(ctx.srcAttr -> 1))
+        },
+        (m1, m2) => (m1.keySet ++ m2.keySet)
+          .map(k => k -> (m1.getOrElse(k, 0) + m2.getOrElse(k, 0)))
+          .toMap
+      ).persist(StorageLevel.MEMORY_AND_DISK_SER)
+
+      val gWithPrio = g.mapVertices { case (_, cid) =>
+        (cid, scala.util.Random.nextDouble())
       }
-      if (movedG == 0) { bcSizes.destroy(); return g.mapVertices[Long]{ case (_, v) => v._1 } }
-      bcSizes.destroy()
-      println(s"[ILS] pass=$outer  moved=$movedG")
+
+      val minPrio = gWithPrio.aggregateMessages[Double](
+        t => {
+          val (_, pSrc) = t.srcAttr ; val (_, pDst) = t.dstAttr
+          t.sendToSrc(pDst) ; t.sendToDst(pSrc)
+        },
+        math.min
+      )
+
+      val candidates = gWithPrio.vertices
+        .join(neigh)
+        .leftOuterJoin(minPrio)
+        .flatMap { case (vid, (((cid, prio), neigh), minOpt)) =>
+          val eligible = minOpt.forall(prio < _)
+          if (!eligible) Nil
+          else {
+            val a = neigh.getOrElse(cid, 0)
+            val opts = neigh - cid
+            val nC = bcSize.value.getOrElse(cid, 0L)
+
+            var bestCid = vid                  // open new singleton cluster
+            var bestDelta = 1 - nC + 2 * a     // default delta
+
+            if (opts.nonEmpty) {
+              val (otherCid, b) = opts.maxBy(_._2)
+              val nD = bcSize.value.getOrElse(otherCid, 0L)
+              val delta = nD - nC + 1 + 2 * (a - b)
+              if (delta < bestDelta) {
+                bestCid = otherCid
+                bestDelta = delta
+              }
+            }
+
+            if (bestDelta < 0) Some((vid, bestCid)) else None
+          }
+        }
+
+      val newVerts = g.vertices.leftOuterJoin(candidates).mapValues {
+        case (cid, Some(newCid)) => newCid
+        case (cid, None)         => cid
+      }
+
+      val changed = g.vertices.join(newVerts)
+        .filter { case (_, (oldCid, newCid)) => oldCid != newCid }
+        .count()
+
+      g = Graph(newVerts, g.edges)
+      neigh.unpersist(false)
+
+      println(s"[LS-$clusterId]   moved vertices: $changed")
+      if (changed == 0) return g
     }
-    g.mapVertices[Long]{ case (_, v) => v._1 } // strip size, keep cluster‑id only
+
+    g
   }
 
 
+  def innerLocalSearch(
+      graph: Graph[Long, Int],                       // (vid -> clusterId)
+      sc: SparkContext,
+      numIter: Int = 10
+  ): Graph[Long, Int] = {
+
+    // Group vertices by cluster ID
+    val clusterToVertices: Map[Long, Set[VertexId]] =
+      graph.vertices
+           .map { case (vid, cid) => (cid, Set(vid)) }
+           .reduceByKey(_ ++ _)
+           .collect()
+           .toMap
+
+    // Initialize updatedVertices with the original graph's vertices
+    var updatedVertices: RDD[(VertexId, Long)] = graph.vertices
+
+    for ((clusterId, vertexSet) <- clusterToVertices) {
+
+      val vertexSetBC = sc.broadcast(vertexSet)
+
+      // Create subgraph induced by this cluster
+      val subgraph = graph.subgraph(
+        epred = et =>
+          vertexSetBC.value.contains(et.srcId) &&
+          vertexSetBC.value.contains(et.dstId),
+        vpred = (vid, _) => vertexSetBC.value.contains(vid)
+      ).cache()
+
+      // Run local search loop on the subgraph
+      val refinedSubgraph = localSearchOnSubgraph(subgraph, sc, clusterId, numIter)
+
+      // Update refined cluster assignments
+      val updatedCluster = refinedSubgraph.vertices.mapValues(_ => clusterId)
+
+      // Merge back into overall vertex assignment
+      val updatedMap = updatedVertices.leftOuterJoin(updatedCluster).mapValues {
+        case (origCid, Some(newCid)) => newCid
+        case (origCid, None)         => origCid
+      }
+
+      updatedVertices = updatedMap
+
+      vertexSetBC.unpersist()
+      subgraph.unpersist(blocking = false)
+    }
+
+    Graph(updatedVertices, graph.edges)  // Use original edges (assumed cached)
+  }
 
   def main(args: Array[String]): Unit = {
     if (args.length < 4 || args.length > 5) {
