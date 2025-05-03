@@ -1,4 +1,4 @@
-Clustering Results Analysis
+# Clustering Results Analysis
 
 ## Best Disagreement Results
 | Dataset| Number of Diagreements| Time | Method of Computation|
@@ -9,6 +9,13 @@ Clustering Results Analysis
 |soc-LiveJournal1 | | ||
 |twitter_original_edges | | ||
 |com-orkut.ungraph | | ||
+
+Discussion of the merits of your algorithms such as the theoretical merits (i.e. if you can show your algorithm has certain guarantee).
+The scalability of your approach
+Depth of technicality
+Novelty
+Completeness
+Readability
 
 ## Description of Approach
 In our approach, we used the parallel PIVOT algorithm along with inner local
@@ -31,16 +38,15 @@ that this was an acceptable cost of getting the algorithm to run with less
 overhead and faster. In addition, instead of keeping track of all nodes that
 have been unassigned, our algorithm stops when no new clusters have been formed.
 While this may result in the algorithm stopping prematurely, it avoids a
-`.count()` or some other similar computation and will speed up the algorithm.
+`.count()` or some other similar computation which we found to down the process
+significantly. 
 
 
-After a clustering has been determined, we run inner local search on all the clusters in
-order to reduce the number of disagreements. We chose inner local search because
-through our experimentations, local search proved to be too memory and
-computationally expensive. With inner local search, we only consider the
-vertices and edges of one cluster at a time instead of the whole graph. In the
-ppaer by *Corder and Kollios '23*, they showed that this approach is scalable
-and produces as good as, or better clusterings than regular local search. 
+After a clustering has been determined, we run local search on the graph that
+our PIVOT algorithm outputs. Local search (LS) considers the cost/benefit of 'moving'
+a vertex from one cluster to another. The version of LS found in the literature is hard
+to parallelize, since a vertex's decision to move is based on the clustering of 
+other vertices. 
 
 
 
@@ -48,13 +54,13 @@ With the parallelized PIVOT and local search, we were able to get pretty good
 results. As both are parallelizable, we started with this approach because we
 knew that the algorithm that we used had to scale to much larger graphs. 
 
-## Discussion of Algorithm
+## Theoretical Merits
 The parallized PIVOT algorithm gives a $3$-approximation solution in expectation and takes $O(\log ^2 n)$
 rounds through an analysis from *Blelloch, Fineman, Shun '12*. In addition, the
 Inner Local Search has a runtime of $O((|C_i|+|E_i^+|)I_i)$ per cluster $C_i$,
 where $I_i$ is the number of Local Search iterations that is run per cluster.
 That brings the total time complexity for a graph $G$ as
-$O(|V|+|E^+|+\sum_{i=1}^k (|C_i|+|E_i^+})I_i)$, as shown by *Corder and
+$O(|V|+|E^+|+\sum_{i=1}^k (|C_i|+|E_i^+|)I_i)$, as shown by *Corder and
 Kollios*.
 
 
