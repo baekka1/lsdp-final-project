@@ -10,6 +10,7 @@ import scala.util.Random
 import org.apache.hadoop.fs.{FileSystem, Path}
 import scala.util.hashing.MurmurHash3
 import org.apache.spark.rdd.RDD
+import org.apache.spark.broadcast.Broadcast
 
 
 object main {
@@ -209,7 +210,7 @@ object main {
                  .filter(_._2 != 0L)
                  .distinct()
 
-      // if no new assignments, we’re done
+      // if no new assignments, we're done
       if (allUpdatesRdd.isEmpty()) {
         continue = false
       } else {
@@ -248,9 +249,10 @@ object main {
   }
 
   /** Local search to improve clustering */
-  def localSearch(graph: Graph[Long,Int],
-                  sc: SparkContext,
-                  numIter: Int = 10): Graph[Long,Int] = {
+  def localSearch(
+        graph: Graph[Long,Int],
+        sc: SparkContext,
+        numIter: Int = 10): Graph[Long,Int] = {
 
     var g = Graph(graph.vertices, graph.edges.cache())   // keep edges cached
 
@@ -260,8 +262,8 @@ object main {
       // 1) tiny broadcast: cluster sizes
       val bcSize = sc.broadcast(
         g.vertices.map { case (_,cid) => (cid,1L) }
-                .reduceByKey(_+_)
-                .collectAsMap()
+                  .reduceByKey(_+_)
+                  .collectAsMap()
       )
 
       // 2) heavy neighbour map  (vid -> Map[cid -> deg])
@@ -289,7 +291,7 @@ object main {
         math.min
       )
 
-      // 5) compute moves on the independent-set vertices
+      // 5) compute moves on the independent‑set vertices
       val candidates = gWithPrio.vertices // (vid → (cid,prio))
         .join(neigh) // add neighMap
         .leftOuterJoin(minPrio) // add minNbrPrio
@@ -298,15 +300,21 @@ object main {
           if (!eligible) Nil
           else {
             val a = neigh.getOrElse(cid, 0)
-            val opts = neigh - cid
-            if (opts.isEmpty) Nil
-            else {
-              val (bestD,b) = opts.maxBy(_._2)
-              val nC = bcSize.value.getOrElse(cid,   0L)
-              val nD = bcSize.value.getOrElse(bestD, 0L)
+            val opts = neigh - cid                                   // neighbours in *other* clusters
+            val nC  = bcSize.value.getOrElse(cid, 0L)               // size of current cluster
+
+            // --- best move is either to some neighbour cluster OR to a new singleton cluster
+            var bestCid   = vid        // opening a fresh cluster → use own id
+            var bestDelta = 1 - nC + 2*a    // delta for opening new cluster (nD = 0, b = 0)
+
+            if (opts.nonEmpty) {
+              val (otherCid, b) = opts.maxBy(_._2)                  // b = #pos‑edges to that cluster
+              val nD = bcSize.value.getOrElse(otherCid, 0L)
               val delta = nD - nC + 1 + 2*(a - b)
-              if (delta < 0) Some((vid, bestD)) else Nil
+              if (delta < bestDelta) { bestCid = otherCid ; bestDelta = delta }
             }
+
+            if (bestDelta < 0) Some((vid, bestCid)) else Nil
           }
         }
 
@@ -328,23 +336,144 @@ object main {
     g
   }
 
+  /* ONE independent‑set sweep; returns (updatedGraph, #moved vertices) */
+  def localSearchOnce(
+          g:      Graph[(Long,Long),Int], // (cid,sizeC)
+          bcSize: Broadcast[scala.collection.Map[Long,Long]]
+        ): (Graph[(Long,Long),Int], Long) = {
+
+    // 1) neighbour map: cid -> positive edges to that cluster
+    val neigh = g.aggregateMessages[Map[Long,Int]](
+      ctx => {
+        val (cS,_) = ctx.srcAttr ; val (cD,_) = ctx.dstAttr
+        ctx.sendToSrc(Map(cD -> 1)); ctx.sendToDst(Map(cS -> 1))
+      },
+      (m1,m2) => (m1.keySet ++ m2.keySet)
+                  .map(k => k -> (m1.getOrElse(k,0)+m2.getOrElse(k,0)))
+                  .toMap
+    )
+
+    // 2) priorities & min‑neighbour priority
+    val prio    = g.mapVertices((_,_) => Random.nextDouble())
+    val minPrio = prio.aggregateMessages[Double](
+        ctx => { ctx.sendToSrc(ctx.dstAttr); ctx.sendToDst(ctx.srcAttr) },
+        math.min
+    )
+
+    // 3) decide moves
+    val moves = g.vertices.join(prio.vertices)               
+      .join(neigh)
+      .leftOuterJoin(minPrio)
+      .flatMap { case (vid, ((((cid,nC),p), nMap), minOpt)) =>
+        if (minOpt.exists(p >= _)) Nil // not in i‑set
+        else {
+          val a   = nMap.getOrElse(cid,0)
+          val opt = nMap - cid
+          if (opt.isEmpty) Nil
+          else {
+            val (bestCid,b) = opt.maxBy(_._2)
+            val nD = bcSize.value.getOrElse(bestCid,0L) // O(1)
+            val delta = nD - nC + 1 + 2*(a-b)
+            if (delta < 0) Some((vid,(cid,bestCid))) else Nil
+          }
+        }
+      }
+
+    if (moves.isEmpty) return (g,0L)
+    val moved = moves.count()
+
+    // 4) apply moves & update size counters locally
+    val movedRDD = moves.mapValues(_._2).cache() // vid -> newCid
+    val sizeUpdates = moves.flatMap{ case (_, (oldCid,newCid)) =>
+                          Seq((oldCid,-1L),(newCid,1L))
+                      }.reduceByKey(_+_)
+
+    val g2 = g.joinVertices(movedRDD){ (_, v, newCid) => (newCid, v._2) }
+              .joinVertices(sizeUpdates){ (_, v, d)   => (v._1, v._2+d) }
+              .cache()
+
+    (g2, moved)
+  }
+
+  /** driver‑side, deterministic inner local search (COCOA ’23, Alg. 3)
+    *
+    * @param graph          pivot clustering   (vertex attr = cluster‑id)
+    * @param sc             SparkContext (driver)
+    * @param numInnerIter   ≤ sweeps inside each cluster
+    * @param maxOuterPass   hard cap on global passes
+    */
+  def innerLocalSearch(
+          graph:        Graph[Long,Int],
+          sc:           SparkContext,
+          numInnerIter: Int  = 5,
+          maxOuterPass: Int  = 10): Graph[Long,Int] = {
+
+    // attach initial size
+    var g = graph.mapVertices[Tuple2[Long, Long]]{ case (_, v) => (v, 1L) }.cache()
+    val initSizes = g.aggregateMessages[Long](ctx => ctx.sendToSrc(1L), _+_)
+    g = g.joinVertices(initSizes){ (_, v, sz) => (v._1, sz) }.cache()
+
+    var outer = 0
+    var movedG = 1L
+
+    while (outer < maxOuterPass && movedG > 0) {
+      outer += 1
+      movedG = 0L
+      val bcSizes = sc.broadcast(
+        g.vertices // (vid , (cid , sizeC))
+        .map{ case (_, (cid, _)) => (cid, 1L) }
+        .reduceByKey(_ + _) // (# vertices per cluster)  – small shuffle
+        .collectAsMap() // Map[Long,Long]   (driver)
+      )
+
+      for (cid <- g.vertices.map(_._2._1).distinct().collect()) {
+        val sub = g.subgraph(vpred = (_, c) => c._1 == cid).cache()
+        if (sub.numVertices > 1) {
+          var sg = sub
+          var k  = 0 ; var moved = 1L
+          while (k < numInnerIter && moved > 0) {
+            val res = localSearchOnce(sg, bcSizes)
+            sg   = res._1 ; moved = res._2 ; k += 1
+          }
+          movedG += moved
+          if (moved > 0)
+            g = g.outerJoinVertices(sg.vertices){
+                  case (_, old, Some(newAttr)) => newAttr
+                  case (_, old, None)          => old
+                }.cache()
+        }
+        sub.unpersist(false)
+      }
+      if (movedG == 0) { bcSizes.destroy(); return g.mapVertices[Long]{ case (_, v) => v._1 } }
+      bcSizes.destroy()
+      println(s"[ILS] pass=$outer  moved=$movedG")
+    }
+    g.mapVertices[Long]{ case (_, v) => v._1 } // strip size, keep cluster‑id only
+  }
+
+
 
   def main(args: Array[String]): Unit = {
-    if (args.length != 4) {
-      System.err.println("Usage: final_project method={original, random} <input_edges.csv> <output_path.csv> <n_iterations>")
+    if (args.length < 4 || args.length > 5) {
+      System.err.println(
+        "Usage: final_project pivot={original,random} <input.csv> <output.csv> <n_LS_iters> [ls={regular,inner}]")
       System.exit(1)
     }
-    val method = args(0)
-    val inputPath = args(1)
-    val outputPath = args(2)
-    val tmpDir = outputPath + "_tmp"
 
-    val conf = if (method == "random") new SparkConf().setAppName("ParallelizedPivotClustering")
-      else new SparkConf().setAppName("OriginalParallelizedPivotClustering")
-    val sc   = new SparkContext(conf)
+    val pivotAlg   = args(0)                   // original | random
+    val inputPath  = args(1)
+    val outputPath = args(2)
+    val nLsIter    = args(3).toInt
+    val lsMode     = if (args.length == 5) args(4) else "regular" // default
+
+    val conf  = if (pivotAlg == "random")
+                  new SparkConf().setAppName("ParallelizedPivotClustering")
+                else
+                  new SparkConf().setAppName("OriginalParallelizedPivotClustering")
+    val sc    = new SparkContext(conf)
     val spark = SparkSession.builder.config(conf).getOrCreate()
 
-    // 1) load edges
+    // ---------------------------------------------------------------- pivot
     val edges = sc.textFile(inputPath).map { line =>
       val Array(a,b) = line.split(",").map(_.toLong)
       Edge(a, b, 1)
@@ -356,36 +485,37 @@ object main {
       vertexStorageLevel  = StorageLevel.MEMORY_AND_DISK
     )
 
-    var clustered: Graph[Long, Int] = null
+    println(s"=== Starting $pivotAlg Parallel Pivot ===")
+    val pivoted =
+      if (pivotAlg == "random")   parallelPivotClustering(graph)
+      else                        parallelPivotOriginal(graph)
 
-    val startTime = System.nanoTime()
-    if (method == "random") {
-      println("=== Starting Parallel Pivot Clustering ===")
-      clustered = parallelPivotClustering(graph)
-    } else if (method == "original") {
-      println("=== Starting Original Parallel Pivot Clustering ===")
-      clustered = parallelPivotOriginal(graph)
-    } else {
-      println("not a valid algorithm input")
-      System.exit(1)
-    }
-    println("=== Starting Local Search ===")
-    // Add checking to make sure 4th argument is an int (if necessary)
-    clustered = localSearch(clustered, sc, args(3).toInt)
+    // -------------------------------------------------------------- LS phase
+    val clustered =
+      if (lsMode == "inner") {
+        println("=== Starting InnerLocalSearch ===")
+        innerLocalSearch(pivoted, sc, nLsIter)
+      } else {
+        println("=== Starting LocalSearch ===")
+        localSearch(pivoted, sc, nLsIter)
+      }
+
+    // ---------------------------------------------------------------- stats
     val vertices = clustered.vertices.count()
     println()
     println("==========================================================")
     println(s"Number of vertices: $vertices")
-    val endTime = System.nanoTime()
-    val duration = (endTime - startTime) / 1e9d
-    println(f"Clustering completed in $duration%.2f seconds")
-    println("==========================================================")   
+    println(s"Signed‑cost after LS: ${signedCost(clustered)}")
+    println("==========================================================")
     println()
 
-    val g2df = spark.createDataFrame(clustered.vertices)
-    g2df.coalesce(1).write.format("csv").mode("overwrite").save(args(2))
+    spark.createDataFrame(clustered.vertices)
+         .coalesce(1)
+         .write.format("csv")
+         .mode("overwrite")
+         .save(outputPath)
 
-    println(s"=== Done! Clusters written to $outputPath ===")
+    println(s"=== Done!  Clusters written to $outputPath ===")
     sc.stop()
   }
 }
