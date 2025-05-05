@@ -2,7 +2,7 @@
 By Katie Baek and Rafael Singer
 
 ## Best Disagreement Results
-| Dataset| Number of Diagreements| Time | Algorithm |Method of Computation|
+| Dataset| Number of Disagreements| Time | Algorithm |Method of Computation|
 |--------|-----------------------|------|-----------|-----------|
 |log_normal_100| 1769 | 2.54 seconds| PIVOT + 50 iterations of LS |Local|
 | musae_ENGB_edges | 34266|45.4 seconds | PIVOT + 40 iterations of LS |GCP - N4 Series with 2x2 Cores|
@@ -14,8 +14,9 @@ with 4 x 2 Cores|
 
 
 ## Description of Approach
-In our approach, we used the parallel PIVOT algorithm along with inner local
-search as described in [paper]. The original parallel PIVOT algorithm assigns vertices a
+In our approach, we used the parallel PIVOT algorithm along with a parallelized version of local
+search, inspired by the approach in *Corder and
+Kollios '23*. The original parallel PIVOT algorithm assigns vertices a
 random permutation from 1 to N, then iterates over all the vertices and chooses
 the vertex with the lowest assigned permutation out of all of its neighbors as
 the pivot. Vertices then join their nearest pivot neighbor (if applicable) and
@@ -30,9 +31,8 @@ the odds of two vertices being hashed to the number increases but we decided
 that this was an acceptable cost of getting the algorithm to run with less
 overhead and faster. In addition, instead of keeping track of all nodes that
 have been unassigned, our algorithm stops when no new clusters have been formed.
-While this may result in the algorithm stopping prematurely, it avoids a
-`.count()` or some other similar computation which we found to down the process
-significantly. 
+While this may result in the algorithm stopping prematurely, it avoids
+`.count()` repeatedly, which can be expensive on large datasets.
 
 
 After a clustering has been determined, we run local search on the graph that
@@ -43,7 +43,7 @@ cluster, $a$ is a vertices' neighbors in the current cluster and $b$ is a
 vertices' neighbors in the target cluster. The version of LS found in the literature is hard
 to parallelize, since a vertex's decision to move is based on the clustering of 
 other vertices and thus must be performed sequentially. So instead, we came up with a PIVOT-like version of LS which
-ensures that every vertex that is moved is in its own indepedent set. This way,
+ensures that every vertex that is moved is in its own independent set. This way,
 LS can be parallelized and multiple vertices can move at a time safely since it
 is a constraint that they be in their own 'set'. LS is then repeated a certain
 number of iterations, or until no other improvements can be made. 
@@ -55,12 +55,16 @@ our algorithms on graphs such as `log_normal_100.csv`, then we would opt for
 that one over the PIVOT LS. 
 
 ## Theoretical Merits
-The parallized PIVOT algorithm which we based our algorithm off of gives a $3$-approximation solution in expectation and takes $O(\log ^2 n)$
-rounds through an analysis from *Blelloch, Fineman, Shun '12*. In addition, the
-Local Search has a runtime of $O((|C_i|+|E_i^+|))$ per iteration, giving a total
-runtime of $O((|V|+|E^+|)I)$ where I is the total number of LS iterations, as shown by *Corder and
-Kollios*. However, with our changes to the algorithm, including getting rid of
-the true randomness, the approximation probably does not hold. 
+The parallel PIVOT algorithm provides a **3-approximation in expectation** and completes in `O(log² n)` rounds, as analyzed in *Blelloch, Fineman & Shun (2012)*. Local search, as implemented in the literature, runs in `O((|V| + |E⁺|) * I)` time where `I` is the number of iterations (*Corder and Kollios '23*).
+
+However, our parallel PIVOT algorithm is only *inspired* by a randomized process. As previously mentioned, in our implementation, we replaced random sampling with a deterministic hash function** (`MurmurHash3`) to assign vertex priorities. This choice was motivated by two practical considerations:
+
+1. **Reproducibility** — hash-based assignments ensure that the same input graph will always yield the same clustering.
+2. **Performance** — we observed in practice that using hashes avoided the overhead of random number generation and led to more consistent and often lower disagreement counts, especially on large graphs.
+
+While hash functions approximate randomness, they lack the full independence assumptions required by the original theoretical analysis. As a result, the 3-approximation guarantee for the randomized PIVOT algorithm from *Blelloch, Fineman & Shun (2012)* no longer formally applies to our implementation.
+
+Our local search modification also changes the theoretical approximation guarantees. Standard LS can converge to a local optimum with a (2+ε)-approximation, assuming optimal move selection. Our LS variant restricts candidate moves to a priority-based independent set (to enable parallelization), so we sacrifice this approximation bound. However, our local search remains monotonic: each LS iteration does not increase the cost and in practice, we observe significant cost reduction in early iterations, with diminishing returns over time.
 
 ## Misc.
 The code provided contains all our of approaches, including with the original
