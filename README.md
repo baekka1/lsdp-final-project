@@ -38,19 +38,16 @@ While this may result in the algorithm stopping prematurely, it avoids
 After a clustering has been determined, we run local search on the graph that
 our PIVOT algorithm outputs. Local search (LS) considers the cost/benefit of 'moving'
 a vertex from one cluster to another, based off of a cost function described as 
-$nD-nC+1+2(a-b)$, where $nD$ and $nC$ are size of the current cluster and target
-cluster, $a$ is a vertices' neighbors in the current cluster and $b$ is a
-vertices' neighbors in the target cluster. The version of LS found in the literature is hard
-to parallelize, since a vertex's decision to move is based on the clustering of 
-other vertices and thus must be performed sequentially. So instead, we came up with a PIVOT-like version of LS which
-ensures that every vertex that is moved is in its own independent set. This way,
-LS can be parallelized and multiple vertices can move at a time safely since it
-is a constraint that they be in their own 'set'. LS is then repeated a certain
+$nD-nC+1+2(a-b)$, where $nC$ and $nD$ are size of the current cluster $C$ and target
+cluster $D$, $a$ is a vertices' neighbors in the current cluster $C$ and $b$ is a
+vertices' neighbors in the target cluster $D$. Cost is effectively the positive edges across clusters + the negative edges within clusters. For the former, all edges from $a$ now cross clusters, adding to the cost, the edges from $b$ can be subtracted, giving us $a-b$. For the latter, before the move, the number of “missing” edges in $C$ was $nC - 1 - a$ (the total number of vertices in C, minus 1 for the current vertex, minus all the neighbors of $a$ in $C$ since those edges are present). We subtract this from the cost after the move. $nD$ is the number of vertices in $D$ so number of non-neighbors for the current vertex in $D$ is $nD - b$ — this adds to the cost after the move. Thus, adding the two terms together we derive our cost function.  
+
+The version of LS found in the literature is hard to parallelize, since a vertex's decision to move is based on the clustering of other vertices and thus must be performed sequentially. So instead, we came up with a PIVOT-like version of LS which ensures that every vertex that is moved is in its own independent set. This way, LS can be parallelized and multiple vertices can move at a time safely since it is a constraint that they are in their own 'set'. LS is then repeated a certain
 number of iterations, or until no other improvements can be made. 
 
 We chose this approach because it scales to much larger graphs with the addition
 of more machines, as we found with the orkurt graph. We also found that our
-original non-PIVOT LS worked better with the smaller graphs so if we were to run
+original non-PIVOT (sequential) LS worked better with the smaller graphs so if we were to run
 our algorithms on graphs such as `log_normal_100.csv`, then we would opt for
 that one over the PIVOT LS. 
 
@@ -64,10 +61,10 @@ However, our parallel PIVOT algorithm is only *inspired* by a randomized process
 
 While hash functions approximate randomness, they lack the full independence assumptions required by the original theoretical analysis. As a result, the 3-approximation guarantee for the randomized PIVOT algorithm from *Blelloch, Fineman & Shun (2012)* no longer formally applies to our implementation.
 
-Our local search modification also changes the theoretical approximation guarantees. Standard LS can converge to a local optimum with a (2+ε)-approximation, assuming optimal move selection. Our LS variant restricts candidate moves to a priority-based independent set (to enable parallelization), so we sacrifice this approximation bound. However, our local search remains monotonic: each LS iteration does not increase the cost and in practice, we observe significant cost reduction in early iterations, with diminishing returns over time.
+Our local search modification also changes the theoretical approximation guarantees. Standard LS can converge to a local optimum with a (2+ε)-approximation, assuming optimal move selection. Our LS variant restricts candidate moves to a priority-based independent set (to enable parallelization), so we sacrifice this approximation bound. However, our local search remains monotonic: each LS iteration does not increase the cost. In practice, we observe significant cost reduction in early iterations, with diminishing returns over time.
 
 ## Misc.
-The code provided contains all our of approaches, including with the original
+The code provided contains all our of approaches, including the original
 permuation and InnerLocalSearch attempts. The `log_100_main.scala` file is the
 one used for the `log_normal_100.csv` file. 
 
